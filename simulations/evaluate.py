@@ -315,7 +315,7 @@ def _get_action_tensor(action, num_envs, device):
     return action
 
 
-def simulate(env, obs_socket, act_socket, init_poses):
+def simulate(env, obs_socket, act_socket, init_poses, sim_speed_factor=1.0):
     import configs.robot_cfg
     import configs.termination_cfg
 
@@ -325,6 +325,9 @@ def simulate(env, obs_socket, act_socket, init_poses):
     # The simulation loop
     term_mgr = env.env.termination_manager
     done_term = configs.termination_cfg.get_done_term(term_mgr.active_terms)
+    # Wall-clock budget per env step; smaller budget => env runs faster than
+    # real-time, so a fixed inference latency missed more deadlines.
+    target_dt = env.env.step_dt / sim_speed_factor
     tick = time.perf_counter()
     step_time = None
     while sim_results["status"] == -1:
@@ -343,7 +346,7 @@ def simulate(env, obs_socket, act_socket, init_poses):
         obs_socket.send_pyobj(
             {
                 "dt_scale": (
-                    1.0 if step_time is None else max(1.0, step_time / env.env.step_dt)
+                    1.0 if step_time is None else max(1.0, step_time / target_dt)
                 ),
                 "index": len(sim_results["cam_views"]) - 1,
                 "observation.state": {
@@ -374,9 +377,9 @@ def simulate(env, obs_socket, act_socket, init_poses):
 
         env.step(last_action)
         step_time = time.perf_counter() - tick
-        # Make sure each step takes at least step_dt seconds
-        if step_time < env.env.step_dt:
-            time.sleep(env.env.step_dt - step_time)
+        # Make sure each step takes at least target_dt seconds
+        if step_time < target_dt:
+            time.sleep(target_dt - step_time)
 
         tick = time.perf_counter()
         logging.debug(
@@ -384,7 +387,7 @@ def simulate(env, obs_socket, act_socket, init_poses):
             % (
                 len(sim_results["cam_views"]) - 1,
                 step_time,
-                step_time / env.env.step_dt,
+                step_time / target_dt,
                 (action.shape if isinstance(action, torch.Tensor) else None),
             )
         )
@@ -460,7 +463,13 @@ def get_sim_results(sim_cfg, env_cfg_file_path, obs_socket, act_socket):
 
     # Send the task instruction at the beginning of the simulation
     obs_socket.send_pyobj({"task": instruction})
-    sim_results = simulate(env, obs_socket, act_socket, sim_cfg["init_poses"])
+    sim_results = simulate(
+        env,
+        obs_socket,
+        act_socket,
+        sim_cfg["init_poses"],
+        sim_cfg.get("sim_speed_factor", 1.0),
+    )
     logging.info("Simulation finished with code: %d" % sim_results["status"])
     # Clear the action socket
     get_latest_action(act_socket)
@@ -516,6 +525,7 @@ def main(simulation_app, args):
         "disable_fabric": args.disable_fabric,
         "path_tracing": args.path_tracing,
         "init_poses": init_poses,
+        "sim_speed_factor": args.sim_speed_factor,
     }
     while simulation_app.is_running():
         action = get_latest_action(act_socket)
@@ -626,6 +636,17 @@ if __name__ == "__main__":
     # Arguments for the script
     parser.add_argument("--path_tracing", action="store_true")
     parser.add_argument("--physics_time_step", type=float, default=0.04)
+    parser.add_argument(
+        "--sim_speed_factor",
+        type=float,
+        default=1.0,
+        help=(
+            "Wall-clock speed multiplier for the env step loop. "
+            ">1 makes the env run faster than real-time (a fixed model "
+            "inference latency looks relatively slower); <1 slows the env "
+            "(latency looks relatively faster). Physics dt is unchanged."
+        ),
+    )
     parser.add_argument("--tolerance", type=float, default=0.07)
     parser.add_argument(
         "--scene_dir", default=os.path.join(PROJECT_HOME, os.pardir, "scenes")
