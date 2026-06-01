@@ -297,6 +297,21 @@ def get_latest_action(act_socket):
     return action
 
 
+def wait_for_action(act_socket):
+    # Block until at least one action arrives, then drain any extras so we
+    # always advance with the freshest one. This gives an "ideal zero
+    # inference latency" view: the env effectively pauses while the model
+    # produces a new action.
+    action = act_socket.recv_pyobj()
+    while True:
+        try:
+            action = act_socket.recv_pyobj(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            break
+
+    return action
+
+
 def _get_action_tensor(action, num_envs, device):
     if isinstance(action, np.ndarray):
         action = torch.from_numpy(action).to(device)
@@ -315,7 +330,7 @@ def _get_action_tensor(action, num_envs, device):
     return action
 
 
-def simulate(env, obs_socket, act_socket, init_poses):
+def simulate(env, obs_socket, act_socket, init_poses, ideal_zero_latency=False):
     import configs.robot_cfg
     import configs.termination_cfg
 
@@ -340,11 +355,17 @@ def simulate(env, obs_socket, act_socket, init_poses):
         )
         sim_results["cam_views"].append(cam_view)
         sim_results["ee_path"].append(curr_state["end_effector"]["pos"].cpu().numpy())
+        # Under ideal-zero-latency mode the env blocks on each action, so the
+        # model is never "behind" — pin dt_scale to 1.0 to suppress the
+        # policy's dt_scale-driven self-sleep.
+        dt_scale = (
+            1.0
+            if ideal_zero_latency or step_time is None
+            else max(1.0, step_time / env.env.step_dt)
+        )
         obs_socket.send_pyobj(
             {
-                "dt_scale": (
-                    1.0 if step_time is None else max(1.0, step_time / env.env.step_dt)
-                ),
+                "dt_scale": dt_scale,
                 "index": len(sim_results["cam_views"]) - 1,
                 "observation.state": {
                     "end_effector": {
@@ -356,7 +377,10 @@ def simulate(env, obs_socket, act_socket, init_poses):
             }
         )
 
-        action = get_latest_action(act_socket)
+        if ideal_zero_latency:
+            action = wait_for_action(act_socket)
+        else:
+            action = get_latest_action(act_socket)
         if action is not None and "action" in action:
             action = _get_action_tensor(
                 action["action"], env.unwrapped.num_envs, env.unwrapped.device
@@ -374,8 +398,10 @@ def simulate(env, obs_socket, act_socket, init_poses):
 
         env.step(last_action)
         step_time = time.perf_counter() - tick
-        # Make sure each step takes at least step_dt seconds
-        if step_time < env.env.step_dt:
+        # Real-time pacing only applies when we are NOT pretending the model
+        # has zero inference latency. In ideal mode we let the env step as
+        # fast as the model+sim can manage.
+        if not ideal_zero_latency and step_time < env.env.step_dt:
             time.sleep(env.env.step_dt - step_time)
 
         tick = time.perf_counter()
@@ -460,7 +486,13 @@ def get_sim_results(sim_cfg, env_cfg_file_path, obs_socket, act_socket):
 
     # Send the task instruction at the beginning of the simulation
     obs_socket.send_pyobj({"task": instruction})
-    sim_results = simulate(env, obs_socket, act_socket, sim_cfg["init_poses"])
+    sim_results = simulate(
+        env,
+        obs_socket,
+        act_socket,
+        sim_cfg["init_poses"],
+        sim_cfg.get("ideal_zero_latency", False),
+    )
     logging.info("Simulation finished with code: %d" % sim_results["status"])
     # Clear the action socket
     get_latest_action(act_socket)
@@ -516,6 +548,7 @@ def main(simulation_app, args):
         "disable_fabric": args.disable_fabric,
         "path_tracing": args.path_tracing,
         "init_poses": init_poses,
+        "ideal_zero_latency": args.ideal_zero_latency,
     }
     while simulation_app.is_running():
         action = get_latest_action(act_socket)
@@ -626,6 +659,16 @@ if __name__ == "__main__":
     # Arguments for the script
     parser.add_argument("--path_tracing", action="store_true")
     parser.add_argument("--physics_time_step", type=float, default=0.04)
+    parser.add_argument(
+        "--ideal_zero_latency",
+        action="store_true",
+        help=(
+            "Pretend the policy has zero inference latency: env blocks each "
+            "step until a fresh action arrives, dt_scale is pinned to 1.0, "
+            "and real-time pacing is disabled. Upper-bound for control "
+            "performance, independent of inference speed."
+        ),
+    )
     parser.add_argument("--tolerance", type=float, default=0.07)
     parser.add_argument(
         "--scene_dir", default=os.path.join(PROJECT_HOME, os.pardir, "scenes")
