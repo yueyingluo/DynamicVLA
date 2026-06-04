@@ -297,11 +297,16 @@ def get_latest_action(act_socket):
     return action
 
 
-def wait_for_action(act_socket):
-    # Block until at least one action arrives, then drain any extras so we
-    # always advance with the freshest one. This gives an "ideal zero
-    # inference latency" view: the env effectively pauses while the model
-    # produces a new action.
+def wait_for_action(act_socket, timeout_ms=1000):
+    # Block (with a timeout) until an action arrives, then drain any extras
+    # so we always advance with the freshest one. The timeout exists so the
+    # env doesn't deadlock during the policy's warm-up window, where
+    # _get_action() returns None and no action is published. Returns None
+    # if nothing arrived within the timeout, letting the caller fall back
+    # to the previous/init action.
+    if not act_socket.poll(timeout_ms):
+        return None
+
     action = act_socket.recv_pyobj()
     while True:
         try:
